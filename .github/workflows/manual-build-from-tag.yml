@@ -7,14 +7,19 @@ on:
         description: 'Tag to build (e.g. v0.5.3)'
         required: true
         type: string
+      use_self_hosted:
+        description: 'Run on self-hosted runner instead of GitHub-hosted'
+        required: false
+        type: boolean
+        default: false
 
 env:
   VCPKG_ROOT: ${{ github.workspace }}\..\vcpkg
   VCPKG_BUILD_TYPE: release
 
 jobs:
-  build:
-    runs-on: windows-2022
+  build-windows:
+    runs-on: ${{ github.event.inputs.use_self_hosted == 'true' && 'self-hosted' || 'windows-2022' }}
 
     steps:
       - name: Checkout source with full history and tags
@@ -36,7 +41,7 @@ jobs:
           git checkout $tag
           Write-Host "Successfully checked out tag $tag"
 
-      - name: Extract version (without 'v' prefix)
+      - name: Extract version
         id: version
         shell: pwsh
         run: |
