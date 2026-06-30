@@ -15,7 +15,6 @@
 #include "rendering/rendering_manager.hpp"
 #include "scene/scene_manager.hpp"
 #include "visualizer/scene_coordinate_utils.hpp"
-
 #include <algorithm>
 #include <cmath>
 #include <glm/gtc/matrix_transform.hpp>
