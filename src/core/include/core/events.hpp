@@ -63,6 +63,7 @@ namespace lfs::core {
             EVENT(ImportColmapCameras, std::filesystem::path sparse_path;);
             EVENT(LoadConfigFile, std::filesystem::path path;);
             EVENT(ShowDatasetLoadPopup, std::filesystem::path dataset_path;);
+            EVENT(ShowVideoExtractor, std::filesystem::path video_path;);
             EVENT(ShowResumeCheckpointPopup, std::filesystem::path checkpoint_path;);
             EVENT(NewProject, );
             EVENT(RequestExit, );
@@ -236,6 +237,11 @@ namespace lfs::core {
                   float ram_percent;);
             EVENT(FrameRendered, float render_ms; float fps; int num_gaussians;);
             EVENT(KeyframeListChanged, size_t count;);
+            EVENT(VramPressure,
+                  std::string domain;
+                  size_t requested_bytes;
+                  size_t freed_bytes;
+                  bool recovered;);
 
             EVENT(ExportFailed, std::string error;);
             EVENT(VideoExportCompleted, std::filesystem::path path; int total_frames;);
@@ -245,6 +251,7 @@ namespace lfs::core {
 
             // CUDA version check
             EVENT(CudaVersionUnsupported, int major; int minor; int min_major; int min_minor;);
+            EVENT(CudaUnavailable, std::string message;);
         } // namespace state
 
         // ============================================================================

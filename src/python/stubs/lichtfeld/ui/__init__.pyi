@@ -2191,6 +2191,15 @@ def is_gt_comparison_active() -> bool:
     Returns true if ground-truth comparison split view is currently enabled.
     """
 
+def get_gt_comparison_mode() -> str:
+    """Get ground-truth comparison mode: rgb, normal, or depth."""
+
+def set_gt_comparison_mode(mode: str) -> None:
+    """Set ground-truth comparison mode."""
+
+def cycle_gt_comparison_mode() -> str:
+    """Cycle ground-truth comparison mode: rgb -> normal -> depth -> rgb."""
+
 def reveal_in_file_manager(path: str) -> bool:
     """
     Reveal a file or directory in the OS file manager. Returns true on success.
@@ -2477,6 +2486,12 @@ def get_transform_space() -> int:
 
 def set_transform_space(space: int) -> None:
     """Set transform space (0=Local, 1=World)"""
+
+def get_multi_transform_mode() -> int:
+    """Get multi-transform mode (0=Group, 1=Individual)"""
+
+def set_multi_transform_mode(mode: int) -> None:
+    """Set multi-transform mode (0=Group, 1=Individual)"""
 
 def request_thumbnail(video_id: str) -> None:
     """Request download of a YouTube thumbnail for the given video ID"""

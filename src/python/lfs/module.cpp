@@ -78,6 +78,7 @@
 #include "visualizer/scene_coordinate_utils.hpp"
 #include "visualizer/training/training_manager.hpp"
 #include "visualizer/visualizer.hpp"
+#include "visualizer/window/vulkan_context.hpp"
 #include "visualizer/window/window_manager.hpp"
 
 #include <atomic>
@@ -1477,6 +1478,7 @@ NB_MODULE(lichtfeld, m) {
             auto it = cache.find(name);
             if (it != cache.end())
                 return it->second;
+            lfs::python::require_ui_texture_creation_thread();
             try {
                 const auto path = lfs::vis::getAssetPath("icon/" + name + ".png");
                 const auto [data, width, height, channels] = lfs::core::load_image_with_alpha(path);
@@ -1516,38 +1518,22 @@ NB_MODULE(lichtfeld, m) {
             const auto* controller = lfs::vis::InputController::instance();
             if (!controller)
                 return "orbit";
-            switch (controller->cameraNavigationMode()) {
-            case lfs::vis::InputController::CameraNavigationMode::Orbit: return "orbit";
-            case lfs::vis::InputController::CameraNavigationMode::Trackball: return "trackball";
-            case lfs::vis::InputController::CameraNavigationMode::FPV: return "fpv";
-            }
-            return "orbit";
+            return lfs::vis::InputController::cameraNavigationModeName(
+                controller->cameraNavigationMode());
         },
-        "Get the active camera navigation mode ('orbit', 'trackball', or 'fpv')");
+        "Get the active camera navigation mode ('orbit', 'trackball', 'fpv', or 'drone')");
     m.def(
         "set_camera_navigation_mode", [](const std::string& mode) {
             auto* controller = lfs::vis::InputController::instance();
             if (!controller)
                 return;
 
-            if (mode == "orbit") {
-                controller->setCameraNavigationMode(
-                    lfs::vis::InputController::CameraNavigationMode::Orbit);
-                return;
+            const auto parsed = lfs::vis::InputController::cameraNavigationModeFromName(mode);
+            if (!parsed) {
+                throw std::invalid_argument(
+                    "camera navigation mode must be 'orbit', 'trackball', 'turntable', 'fpv', 'fly', or 'drone'");
             }
-            if (mode == "trackball" || mode == "turntable") {
-                controller->setCameraNavigationMode(
-                    lfs::vis::InputController::CameraNavigationMode::Trackball);
-                return;
-            }
-            if (mode == "fpv" || mode == "fly") {
-                controller->setCameraNavigationMode(
-                    lfs::vis::InputController::CameraNavigationMode::FPV);
-                return;
-            }
-
-            throw std::invalid_argument(
-                "camera navigation mode must be 'orbit', 'trackball', 'turntable', 'fpv', or 'fly'");
+            controller->setCameraNavigationMode(*parsed);
         },
         nb::arg("mode"), "Set the active camera navigation mode");
     m.def(
@@ -1573,6 +1559,18 @@ NB_MODULE(lichtfeld, m) {
             return wm ? wm->isFullscreen() : false;
         },
         "Check if the window is in fullscreen mode");
+    m.def(
+        "get_vulkan_capabilities", []() {
+            nb::dict capabilities;
+            const auto* const window = lfs::vis::services().windowOrNull();
+            const auto* const context = window != nullptr ? window->getVulkanContext() : nullptr;
+            capabilities["mesh_wireframe"] =
+                context != nullptr && context->hasFillModeNonSolid();
+            capabilities["wide_lines"] =
+                context != nullptr && context->hasWideLines();
+            return capabilities;
+        },
+        "Return Vulkan device capabilities used to gate rendering controls");
     m.def(
         "toggle_ui", []() { lfs::core::events::ui::ToggleUI{}.emit(); },
         "Toggle UI overlay visibility");
@@ -1756,6 +1754,9 @@ NB_MODULE(lichtfeld, m) {
             return cb;
         },
         nb::arg("callback"), "Decorator for training end handler");
+
+    m.def("_clear_training_hooks", []() { ControlBoundary::instance().clear_all(); });
+    nb::module_::import_("atexit").attr("register")(m.attr("_clear_training_hooks"));
 
     // Register Tensor class
     lfs::python::register_tensor(m);
