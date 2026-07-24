@@ -5,6 +5,7 @@
 #pragma once
 
 #include "core/cuda_version.hpp"
+#include "core/error_bus.hpp"
 #include "core/events.hpp"
 #include "core/export.hpp"
 #include "core/parameters.hpp"
@@ -12,6 +13,7 @@
 #include "gui/async_task_manager.hpp"
 #include "gui/gizmo_manager.hpp"
 #include "gui/global_context_menu.hpp"
+#include "gui/gui_error_consumer.hpp"
 #include "gui/panel_layout.hpp"
 #include "gui/panel_registry.hpp"
 #include "gui/panels/menu_bar.hpp"
@@ -20,6 +22,7 @@
 #include "gui/rml_right_panel.hpp"
 #include "gui/rml_shell_frame.hpp"
 #include "gui/rml_status_bar.hpp"
+#include "gui/rml_toast_overlay.hpp"
 #include "gui/rml_viewport_overlay.hpp"
 #include "gui/rmlui/rmlui_manager.hpp"
 #include "gui/sequencer_ui_manager.hpp"
@@ -44,7 +47,6 @@
 #include <utility>
 #include <vector>
 #include <vulkan/vulkan.h>
-#include <imgui.h>
 
 struct SDL_Cursor;
 
@@ -88,6 +90,7 @@ namespace lfs::vis {
             [[nodiscard]] AsyncTaskManager& asyncTasks() { return async_tasks_; }
             [[nodiscard]] const AsyncTaskManager& asyncTasks() const { return async_tasks_; }
             void enqueueModal(lfs::core::ModalRequest request);
+            void enqueueToast(ToastRequest request);
             [[nodiscard]] GizmoManager& gizmo() { return gizmo_manager_; }
             [[nodiscard]] const GizmoManager& gizmo() const { return gizmo_manager_; }
             [[nodiscard]] PanelLayoutManager& panelLayout() { return panel_layout_; }
@@ -208,14 +211,6 @@ namespace lfs::vis {
             void updateInputOverrides(const PanelInputState& input, bool mouse_in_viewport);
             void applyUiScale(float scale);
             void rebuildFonts(float scale);
-            void loadImGuiSettings();
-            void saveImGuiSettings() const;
-            void persistImGuiSettingsIfNeeded();
-            void beginImGuiPlatformFrame(WindowManager* window_manager,
-                                         VulkanContext* vulkan_context);
-            [[nodiscard]] bool shouldUseCachedImGuiResizeFrame(
-                const WindowManager* window_manager,
-                const VulkanContext* vulkan_context) const;
             void initCustomCursors();
             void destroyCustomCursors();
             void applyRmlCursorRequest(RmlCursorRequest req);
@@ -279,6 +274,7 @@ namespace lfs::vis {
 
             // Owned components
             std::unique_ptr<RmlModalOverlay> rml_modal_overlay_;
+            std::unique_ptr<RmlToastOverlay> rml_toast_overlay_;
             std::unique_ptr<lfs::gui::IVideoExtractorWidget> video_widget_;
 
             // UI state only
@@ -315,15 +311,14 @@ namespace lfs::vis {
             bool ui_hidden_ = false;
 
             // Font storage
-            ImFont* font_regular_ = nullptr;
-            ImFont* font_bold_ = nullptr;
-            ImFont* font_heading_ = nullptr;
-            ImFont* font_small_ = nullptr;
-            ImFont* font_section_ = nullptr;
-            ImFont* font_monospace_ = nullptr;
-            ImFont* mono_fonts_[FontSet::MONO_SIZE_COUNT] = {};
+            FontSet::FontHandle font_regular_ = nullptr;
+            FontSet::FontHandle font_bold_ = nullptr;
+            FontSet::FontHandle font_heading_ = nullptr;
+            FontSet::FontHandle font_small_ = nullptr;
+            FontSet::FontHandle font_section_ = nullptr;
+            FontSet::FontHandle font_monospace_ = nullptr;
+            FontSet::FontHandle mono_fonts_[FontSet::MONO_SIZE_COUNT] = {};
             float mono_font_scales_[FontSet::MONO_SIZE_COUNT] = {};
-            std::filesystem::path imgui_ini_path_;
             FontSet buildFontSet() const;
 
             // Async task management
@@ -355,9 +350,6 @@ namespace lfs::vis {
 
             // RmlUI integration
             RmlUIManager rmlui_manager_;
-            std::chrono::steady_clock::time_point last_imgui_platform_frame_time_{};
-            std::uint64_t cached_imgui_resize_frame_count_ = 0;
-            bool used_cached_imgui_resize_frame_ = false;
             std::unique_ptr<lfs::vis::VulkanViewportPass> vulkan_viewport_pass_;
             lfs::rendering::CudaVulkanUploadStream vulkan_interop_upload_stream_;
             std::vector<std::unique_ptr<VulkanSceneInteropTarget>> vulkan_scene_interop_;
@@ -445,6 +437,13 @@ namespace lfs::vis {
             };
 
             DevResourceWatchState dev_resource_watch_;
+
+            // Native ErrorBus surfacing (Phase 8). Declared last so
+            // error_subscription_ unsubscribes before any other member (the
+            // modal overlay included) is torn down; error_consumer_ outlives
+            // its subscription per the frozen lifetime rule.
+            std::unique_ptr<GuiErrorConsumer> error_consumer_;
+            lfs::Subscription error_subscription_;
         };
     } // namespace gui
 } // namespace lfs::vis

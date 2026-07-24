@@ -10,6 +10,7 @@
 #include "gui/rmlui/vulkan/rmlui_shaders_spv.hpp"
 #include "internal/resource_paths.hpp"
 #include "python/python_runtime.hpp"
+#include "rendering/vulkan_wait.hpp"
 #include <RmlUi/Core/Core.h>
 #include <RmlUi/Core/FileInterface.h>
 #include <RmlUi/Core/Log.h>
@@ -27,6 +28,7 @@
 #include <optional>
 #include <semaphore>
 #include <stb_image.h>
+#include <stop_token>
 #include <string.h>
 #include <string>
 #include <string_view>
@@ -321,6 +323,7 @@ RenderInterface_VK::RenderInterface_VK() : m_is_transform_enabled{false},
                                            m_depth_stencil_format{},
                                            m_texture_depthstencil{},
                                            m_pending_for_deletion_textures_by_frames{},
+                                           m_live_textures{},
                                            m_render_layers{},
                                            m_external_swapchain_image{},
                                            m_external_swapchain_image_view{},
@@ -858,6 +861,7 @@ Rml::TextureHandle RenderInterface_VK::SaveLayerAsTexture() {
 
     BeginLayerRendering(static_cast<Rml::LayerHandle>(m_render_layer_stack_size), false);
 
+    RegisterLiveTexture(texture);
     return reinterpret_cast<Rml::TextureHandle>(texture);
 }
 
@@ -893,6 +897,7 @@ Rml::TextureHandle RenderInterface_VK::LoadTexture(Rml::Vector2i& texture_dimens
         texture->m_p_vma_allocation = VK_NULL_HANDLE;
         texture_dimensions.x = vk_request->width;
         texture_dimensions.y = vk_request->height;
+        RegisterLiveTexture(texture);
         return reinterpret_cast<Rml::TextureHandle>(texture);
     }
 
@@ -1144,8 +1149,10 @@ RenderInterface_VK::async_preview_result_t RenderInterface_VK::DecodePreviewText
 }
 
 void RenderInterface_VK::QueueTextureForDeferredDeletion(texture_data_t* texture) {
-    if (texture)
+    if (texture) {
+        UnregisterLiveTexture(texture);
         m_pending_for_deletion_textures_by_frames[ActiveResourceSlot()].push_back(texture);
+    }
 }
 
 void RenderInterface_VK::DropAsyncPreviewTexture(texture_data_t* texture) {
@@ -1200,6 +1207,7 @@ void RenderInterface_VK::ProcessAsyncPreviewUploads() {
                 replacement->m_is_async_preview = true;
                 QueueTextureForDeferredDeletion(new texture_data_t(*state->texture));
                 *state->texture = *replacement;
+                UnregisterLiveTexture(replacement);
                 delete replacement;
                 --uploads_remaining;
                 uploaded_any = true;
@@ -1434,6 +1442,7 @@ Rml::TextureHandle RenderInterface_VK::CreateTexture(Rml::Span<const Rml::byte> 
                                   view_debug_name.c_str());
     p_texture->m_p_vk_sampler = texture_sampler;
 
+    RegisterLiveTexture(p_texture.get());
     return reinterpret_cast<Rml::TextureHandle>(p_texture.release());
 }
 
@@ -1559,7 +1568,10 @@ VkRect2D RenderInterface_VK::IntersectContextClip(VkRect2D scissor) const noexce
 }
 
 void RenderInterface_VK::BeginFrame() {
-    Wait();
+    // AMB-C1 soft-fail minimum: non-Ready acquire/fence skips the frame.
+    if (!Wait()) {
+        return;
+    }
 
     m_reclaim_resource_slot = m_semaphore_index_previous;
     m_resource_slot = m_semaphore_index;
@@ -2255,6 +2267,7 @@ void RenderInterface_VK::Destroy_Resources() noexcept {
 
     DestroySamplers();
     Destroy_Textures();
+    Destroy_LiveTextures();
     Destroy_Geometries();
 
     m_manager_descriptors.Shutdown(m_p_device);
@@ -3308,12 +3321,35 @@ void RenderInterface_VK::DestroyResource_StagingBuffer(const buffer_data_t& data
 void RenderInterface_VK::Destroy_Textures() noexcept {
     for (auto& textures : m_pending_for_deletion_textures_by_frames) {
         for (texture_data_t* p_data : textures) {
+            UnregisterLiveTexture(p_data);
             Destroy_Texture(*p_data);
             delete p_data;
         }
 
         textures.clear();
     }
+}
+
+void RenderInterface_VK::Destroy_LiveTextures() noexcept {
+    auto live_textures = std::move(m_live_textures);
+    m_live_textures.clear();
+
+    for (texture_data_t* texture : live_textures) {
+        if (!texture)
+            continue;
+        Destroy_Texture(*texture);
+        delete texture;
+    }
+}
+
+void RenderInterface_VK::RegisterLiveTexture(texture_data_t* texture) {
+    if (texture)
+        m_live_textures.insert(texture);
+}
+
+void RenderInterface_VK::UnregisterLiveTexture(texture_data_t* texture) {
+    if (texture)
+        m_live_textures.erase(texture);
 }
 
 uint32_t RenderInterface_VK::ActiveResourceSlot() const noexcept {
@@ -3333,9 +3369,34 @@ void RenderInterface_VK::WaitForSubmittedFrames() noexcept {
     if (fences.empty())
         return;
 
-    const VkResult status = vkWaitForFences(
-        m_p_device, static_cast<uint32_t>(fences.size()), fences.data(), VK_TRUE, std::numeric_limits<uint64_t>::max());
-    RMLUI_VK_ASSERTMSG(status == VkResult::VK_SUCCESS, "failed to wait for submitted RmlUi Vulkan frames");
+    // Bounded per-fence drain (API is single-fence). Soft-fail: no process abort;
+    // retain in-flight fences on non-Ready (AMB-4).
+    for (const VkFence fence : fences) {
+        lfs::rendering::WaitContext wait_ctx;
+        wait_ctx.fingerprint = "rmlui.wait_submitted_frames";
+        auto wait_outcome = lfs::rendering::wait_fence_bounded(
+            m_p_device,
+            fence,
+            std::stop_token{},
+            lfs::rendering::VulkanWaitPolicy{},
+            wait_ctx);
+        if (!wait_outcome.has_value() ||
+            *wait_outcome != lfs::rendering::WaitOutcome::Ready) {
+            LOG_ERROR(
+                "RmlUi WaitForSubmittedFrames did not reach Ready (fence={:#x}): {}",
+                lfs::rendering::vkHandleValue(fence),
+                wait_outcome.has_value()
+                    ? (*wait_outcome == lfs::rendering::WaitOutcome::Quarantined
+                           ? "Quarantined"
+                           : (*wait_outcome == lfs::rendering::WaitOutcome::Cancelled
+                                  ? "Cancelled"
+                                  : (*wait_outcome == lfs::rendering::WaitOutcome::Shutdown
+                                         ? "Shutdown"
+                                         : "non-Ready")))
+                    : wait_outcome.error().detail());
+            return;
+        }
+    }
 }
 
 void RenderInterface_VK::FreeTransientShaderAllocations(const uint32_t resource_slot) noexcept {
@@ -3817,24 +3878,81 @@ void RenderInterface_VK::DestroyRenderLayers() noexcept {
     m_active_layer = {};
 }
 
-void RenderInterface_VK::Wait() noexcept {
+bool RenderInterface_VK::Wait() noexcept {
     RMLUI_VK_ASSERTMSG(m_p_device, "you must initialize device");
     RMLUI_VK_ASSERTMSG(m_p_swapchain, "you must initialize swapchain");
+    if (!m_p_device || !m_p_swapchain) {
+        return false;
+    }
 
-    constexpr uint64_t kMaxUint64 = std::numeric_limits<uint64_t>::max();
-
-    auto status =
-        vkAcquireNextImageKHR(m_p_device, m_p_swapchain, kMaxUint64, m_semaphores_image_available[m_semaphore_index], nullptr, &m_image_index);
-    RMLUI_VK_ASSERTMSG(status == VkResult::VK_SUCCESS, "failed to vkAcquireNextImageKHR (see status)");
+    // B9 — bounded acquire (AMB-C1 soft-fail minimum; no new WSI recovery machine).
+    bool acquire_suboptimal = false;
+    lfs::rendering::WaitContext acquire_ctx;
+    acquire_ctx.fingerprint = "rmlui.frame.acquire";
+    auto acquire = lfs::rendering::acquire_next_image_bounded(
+        m_p_device,
+        m_p_swapchain,
+        m_semaphores_image_available[m_semaphore_index],
+        VK_NULL_HANDLE,
+        std::stop_token{},
+        lfs::rendering::VulkanWaitPolicy{},
+        acquire_ctx,
+        &acquire_suboptimal);
+    if (!acquire.has_value()) {
+        const auto& err = acquire.error();
+        // Existing RmlUi recreate path is available; OUT_OF_DATE uses it then
+        // soft-fails the frame (Present already recreated on OUT_OF_DATE/SUBOPTIMAL).
+        if (err.code() == lfs::ErrorCode::Unavailable &&
+            err.native().has_value() &&
+            static_cast<VkResult>(err.native()->code) == VK_ERROR_OUT_OF_DATE_KHR) {
+            RecreateSwapchain();
+            return false;
+        }
+        LOG_ERROR("RmlUi frame acquire soft-failed: {}", err.detail());
+        return false;
+    }
+    (void)acquire_suboptimal; // SUBOPTIMAL is success-with-flag; Present may recreate.
+    m_image_index = *acquire;
 
     m_semaphore_index_previous = m_semaphore_index;
     m_semaphore_index = ((m_semaphore_index + 1) % kSwapchainBackBufferCount);
 
-    status = vkWaitForFences(m_p_device, 1, &m_executed_fences[m_semaphore_index_previous], VK_TRUE, kMaxUint64);
-    RMLUI_VK_ASSERTMSG(status == VkResult::VK_SUCCESS, "failed to vkWaitForFences (see status)");
+    // B10 — bounded image fence for the previous ring slot.
+    lfs::rendering::WaitContext fence_ctx;
+    fence_ctx.fingerprint = "rmlui.frame.image_fence";
+    auto fence_outcome = lfs::rendering::wait_fence_bounded(
+        m_p_device,
+        m_executed_fences[m_semaphore_index_previous],
+        std::stop_token{},
+        lfs::rendering::VulkanWaitPolicy{},
+        fence_ctx);
+    if (!fence_outcome.has_value() ||
+        *fence_outcome != lfs::rendering::WaitOutcome::Ready) {
+        LOG_ERROR(
+            "RmlUi frame image-fence wait soft-failed (slot={}): {}",
+            m_semaphore_index_previous,
+            fence_outcome.has_value()
+                ? (*fence_outcome == lfs::rendering::WaitOutcome::Quarantined
+                       ? "Quarantined"
+                       : (*fence_outcome == lfs::rendering::WaitOutcome::Cancelled
+                              ? "Cancelled"
+                              : (*fence_outcome == lfs::rendering::WaitOutcome::Shutdown
+                                     ? "Shutdown"
+                                     : "non-Ready")))
+                : fence_outcome.error().detail());
+        // Do not reset the fence while it may still be in-flight (AMB-4).
+        return false;
+    }
 
-    status = vkResetFences(m_p_device, 1, &m_executed_fences[m_semaphore_index_previous]);
-    RMLUI_VK_ASSERTMSG(status == VkResult::VK_SUCCESS, "failed to vkResetFences (see status)");
+    const VkResult status =
+        vkResetFences(m_p_device, 1, &m_executed_fences[m_semaphore_index_previous]);
+    if (status != VK_SUCCESS) {
+        LOG_ERROR("RmlUi frame fence reset failed: {} ({})",
+                  lfs::rendering::vkResultToString(status),
+                  static_cast<int>(status));
+        return false;
+    }
+    return true;
 }
 
 void RenderInterface_VK::Update_PendingForDeletion_Textures_By_Frame(const uint32_t resource_slot) noexcept {

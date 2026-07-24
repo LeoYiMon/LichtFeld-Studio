@@ -88,6 +88,7 @@ target_link_libraries(lfs_python_runtime
         Python::Python
         glm::glm
     PRIVATE
+        lfs_core
         lfs_logger
 )
 
@@ -171,6 +172,7 @@ nanobind_add_module(
     lfs_py
     NB_STATIC
     lfs/module.cpp
+    lfs/py_error.cpp
     lfs/py_animation.cpp
     lfs/py_command.cpp
     lfs/py_gizmo.cpp
@@ -261,9 +263,8 @@ target_link_libraries(lfs_py PRIVATE
     OpenMeshTools
     CUDA::cudart
     CUDA::curand
+    SDL3::SDL3
     ${CMAKE_DL_LIBS}
-    imgui::imgui
-    implot::implot
     GPUOpen::VulkanMemoryAllocator
     $<IF:$<PLATFORM_ID:Windows>,RmlUi::RmlUi,lfs_rmlui>
 )
